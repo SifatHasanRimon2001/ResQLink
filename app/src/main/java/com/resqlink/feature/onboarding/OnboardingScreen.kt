@@ -52,7 +52,7 @@ import com.resqlink.core.ui.theme.Mint
 private data class OnboardingPage(val title: Int, val body: Int, val icon: ImageVector)
 
 @Composable
-fun OnboardingScreen(onComplete: () -> Unit) {
+fun OnboardingScreen(userMessage: String? = null, onComplete: () -> Unit) {
     val pages = listOf(
         OnboardingPage(R.string.onboarding_welcome_title, R.string.onboarding_welcome_body, Icons.Rounded.Shield),
         OnboardingPage(R.string.onboarding_offline_title, R.string.onboarding_offline_body, Icons.Rounded.OfflineBolt),
@@ -89,6 +89,7 @@ fun OnboardingScreen(onComplete: () -> Unit) {
             }
         }
         Column(Modifier.align(Alignment.BottomCenter)) {
+            userMessage?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(bottom = 12.dp)) }
             Row(Modifier.fillMaxWidth().padding(bottom = 22.dp), horizontalArrangement = Arrangement.Center) {
                 pages.indices.forEach { index ->
                     Box(

@@ -6,6 +6,10 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.resqlink.data.local.ResQLinkDatabase
 import com.resqlink.data.repository.EmergencyRepositoryImpl
+import com.resqlink.data.repository.ProfileRepositoryImpl
+import com.resqlink.domain.model.EmergencyProfile
+import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
 import com.resqlink.domain.model.AlertStatus
 import com.resqlink.domain.model.EmergencyContact
 import com.resqlink.domain.model.EventStatus
@@ -71,16 +75,20 @@ class EmergencyFlowIntegrationTest {
             enabled = false,
         )
         val repository = EmergencyRepositoryImpl(database.emergencyDao())
+        val profiles = ProfileRepositoryImpl(database.profileDao())
+        profiles.save(EmergencyProfile(name = "Test user", notes = "Test notes"))
         val activate = ActivateEmergency(
             repository,
             FakeContacts(listOf(primary, secondary, disabled)),
             notifier,
+            profiles,
         )
 
         val first = activate(batteryLevel = 61)
         val second = activate(batteryLevel = 60)
 
         assertEquals(first.eventId, second.eventId)
+        assertTrue(second.recipients.isEmpty())
         assertEquals(listOf(primary, secondary), first.recipients)
         val activeBeforeLocation = database.emergencyDao().active()
         assertNotNull(activeBeforeLocation)
@@ -92,6 +100,8 @@ class EmergencyFlowIntegrationTest {
             database.emergencyDao().alertsForEvent(first.eventId).map { it.status }.toSet(),
         )
 
+        assertTrue(repository.claimDispatch(first.eventId))
+        assertFalse(repository.claimDispatch(first.eventId))
         repository.recordAlertOutcomes(
             eventId = first.eventId,
             dispatchedRecipientIds = listOf(primary.id),
@@ -125,14 +135,17 @@ class EmergencyFlowIntegrationTest {
     }
 
     private class FakeLocation : LocationRepository {
-        override suspend fun currentLocation() = LocationResult.Available(
-            LocationSnapshot(
-                latitude = 23.8103,
-                longitude = 90.4125,
-                accuracyMeters = 8.5f,
-                capturedAt = 1_725_420_000_000,
-                provider = "test",
-            ),
+        override suspend fun currentLocation() = LocationResult.Available(FAKE_FIX)
+        override suspend fun lastKnownLocation() = LocationResult.Available(FAKE_FIX)
+    }
+
+    private companion object {
+        val FAKE_FIX = LocationSnapshot(
+            latitude = 23.8103,
+            longitude = 90.4125,
+            accuracyMeters = 8.5f,
+            capturedAt = 1_725_420_000_000,
+            provider = "test",
         )
     }
 }

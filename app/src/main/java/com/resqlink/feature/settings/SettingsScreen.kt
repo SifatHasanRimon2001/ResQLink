@@ -60,6 +60,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.resqlink.BuildConfig
 import com.resqlink.R
+import com.resqlink.core.ui.EmergencyMessagePreview
 import com.resqlink.core.ui.GlassCard
 import com.resqlink.core.ui.MenuRow
 import com.resqlink.core.ui.PageHeading
@@ -80,6 +81,7 @@ fun SettingsScreen(
 
     if (showMessage) MessageDialog(
         current = state.settings.emergencyMessage,
+        preview = state.messagePreview,
         onDismiss = { showMessage = false },
         onSave = { viewModel.setMessage(it); showMessage = false },
     )
@@ -88,9 +90,9 @@ fun SettingsScreen(
             onDismissRequest = { showClear = false },
             icon = { Icon(Icons.Rounded.DeleteForever, null, tint = MaterialTheme.colorScheme.error) },
             title = { Text(stringResource(R.string.clear_data_title)) },
-            text = { Text(stringResource(R.string.clear_data_body)) },
+            text = { Text(if (state.hasActiveEmergency) "Stop the active emergency before clearing your data." else stringResource(R.string.clear_data_body)) },
             confirmButton = {
-                Button(onClick = { showClear = false; viewModel.clearAll() }) { Text(stringResource(R.string.clear_everything)) }
+                Button(onClick = { showClear = false; viewModel.clearAll() }, enabled = !state.hasActiveEmergency) { Text(stringResource(R.string.clear_everything)) }
             },
             dismissButton = { TextButton(onClick = { showClear = false }) { Text(stringResource(R.string.cancel)) } },
             shape = RoundedCornerShape(28.dp),
@@ -108,6 +110,7 @@ fun SettingsScreen(
         ) {
             Spacer(Modifier.height(16.dp))
             PageHeading(stringResource(R.string.settings_title), stringResource(R.string.settings_subtitle))
+            state.userMessage?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 12.dp)) }
             Spacer(Modifier.height(24.dp))
 
             SectionLabel(stringResource(R.string.appearance))
@@ -209,7 +212,7 @@ private fun ThemeChip(label: String, icon: ImageVector, selected: Boolean, onCli
 }
 
 @Composable
-private fun MessageDialog(current: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+private fun MessageDialog(current: String, preview: (String) -> String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
     var value by remember(current) { mutableStateOf(current) }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -224,6 +227,8 @@ private fun MessageDialog(current: String, onDismiss: () -> Unit, onSave: (Strin
                     supportingText = { Text("${value.length}/500") },
                     shape = RoundedCornerShape(16.dp),
                 )
+                Spacer(Modifier.height(16.dp))
+                EmergencyMessagePreview(preview(value))
             }
         },
         confirmButton = { Button(onClick = { onSave(value) }, enabled = value.isNotBlank()) { Text(stringResource(R.string.save)) } },

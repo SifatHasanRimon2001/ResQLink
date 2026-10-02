@@ -55,6 +55,7 @@ import java.text.DateFormat
 @Composable
 fun HistoryScreen(viewModel: HistoryViewModel) {
     val events by viewModel.events.collectAsStateWithLifecycle()
+    val userMessage by viewModel.userMessage.collectAsStateWithLifecycle()
     var selected by remember { mutableStateOf<EmergencyEvent?>(null) }
     var deleting by remember { mutableStateOf<EmergencyEvent?>(null) }
 
@@ -84,6 +85,7 @@ fun HistoryScreen(viewModel: HistoryViewModel) {
                 PageHeading(stringResource(R.string.history_title), stringResource(R.string.history_subtitle))
                 Spacer(Modifier.height(12.dp))
             }
+            userMessage?.let { message -> item { Text(message, color = MaterialTheme.colorScheme.error) } }
             if (events.isEmpty()) item { EmptyHistory() }
             else items(events, key = { it.id }) { event -> EventCard(event, onClick = { selected = event }) }
             item { Spacer(Modifier.height(32.dp)) }

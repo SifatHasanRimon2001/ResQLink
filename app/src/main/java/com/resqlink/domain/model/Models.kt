@@ -99,14 +99,16 @@ data class ContactValidation(
 }
 
 fun validateContact(name: String, phone: String): ContactValidation {
-    val normalized = buildString {
-        phone.trim().forEachIndexed { index, char ->
-            if (char.isDigit() || (char == '+' && index == 0)) append(char)
-        }
-    }
+    // Ignore presentation separators only, never dial codes, extensions or URI payloads.
+    val trimmed = phone.trim()
+    val normalized = trimmed.filterNot { it == ' ' || it == '-' || it == '(' || it == ')' || it == '.' }
+    val validPhone = trimmed.length <= 64 && normalized.matches(Regex("\\+?[0-9]{7,15}"))
     return ContactValidation(
         normalizedPhone = normalized,
-        nameError = name.trim().isEmpty(),
-        phoneError = normalized.count(Char::isDigit) < 7,
+        nameError = name.trim().isEmpty() || name.length > 200 || name.any(Char::isISOControl),
+        phoneError = !validPhone,
     )
 }
+
+fun normalizeEmergencyMessage(message: String): String =
+    message.trim().take(500).ifBlank { AppSettings.DEFAULT_EMERGENCY_MESSAGE }

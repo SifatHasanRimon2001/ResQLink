@@ -22,6 +22,11 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Keep development/test data separate from installed release app data.
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
@@ -61,6 +66,7 @@ dependencies {
     implementation(libs.androidx.compose.material3)
     implementation(libs.androidx.compose.icons)
     implementation(libs.androidx.room.runtime)
+    implementation(libs.sqlcipher.android)
     implementation(libs.androidx.datastore)
     implementation(libs.kotlinx.coroutines.android)
     implementation(libs.hilt.android)
@@ -75,4 +81,47 @@ dependencies {
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     debugImplementation(libs.androidx.compose.ui.tooling)
     debugImplementation(libs.androidx.compose.ui.test.manifest)
+}
+
+
+// Export resolved versions for the repeatable OSV audit in scripts/security-audit.ps1.
+tasks.register("securityDependencyInventory") {
+    group = "verification"
+    description = "Export resolved runtime, test, and build dependencies for vulnerability checking."
+    doLast {
+        val rows = sortedSetOf<String>()
+        val scopedRows = sortedSetOf<String>()
+        val selected = listOf("releaseRuntimeClasspath", "debugRuntimeClasspath",
+            "debugUnitTestRuntimeClasspath", "debugAndroidTestRuntimeClasspath")
+        configurations.filter {
+            it.isCanBeResolved && (it.name in selected || it.name.contains("ProcessorClasspath") ||
+                it.name.contains("CompilerClasspath") || it.name == "kotlinBuildToolsApiClasspath")
+        }.forEach { configuration ->
+            val resolution = configuration.incoming.resolutionResult
+            check(resolution.allDependencies.none { it is org.gradle.api.artifacts.result.UnresolvedDependencyResult }) {
+                "Cannot audit unresolved dependencies in ${configuration.name}"
+            }
+            resolution.allComponents.forEach { component ->
+                component.moduleVersion?.let {
+                    val row = "${it.group}:${it.name}\t${it.version}"
+                    rows += row
+                    scopedRows += "$row\t${configuration.name}"
+                }
+            }
+        }
+        (listOf(project, rootProject)).forEach { owner ->
+            owner.buildscript.configurations.findByName("classpath")?.incoming?.resolutionResult?.allComponents?.forEach { component ->
+                component.moduleVersion?.let {
+                    val row = "${it.group}:${it.name}\t${it.version}"
+                    rows += row
+                    scopedRows += "$row\tbuildscript"
+                }
+            }
+        }
+        val destination = layout.buildDirectory.file("reports/security/dependencies.tsv").get().asFile
+        destination.parentFile.mkdirs()
+        destination.writeText(rows.joinToString("\n") + "\n")
+        destination.resolveSibling("dependency-scopes.tsv").writeText(scopedRows.joinToString("\n") + "\n")
+        println("Wrote ${rows.size} dependencies to ${destination}")
+    }
 }

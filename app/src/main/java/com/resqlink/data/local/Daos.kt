@@ -20,6 +20,9 @@ interface ContactDao {
     @Query("SELECT EXISTS(SELECT 1 FROM emergency_contacts WHERE phoneNumber = :phone AND id != :excludeId)")
     suspend fun phoneExists(phone: String, excludeId: Long): Boolean
 
+    @Query("SELECT * FROM emergency_contacts WHERE id = :contactId")
+    suspend fun find(contactId: Long): EmergencyContactEntity?
+
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insert(contact: EmergencyContactEntity): Long
 
@@ -29,7 +32,7 @@ interface ContactDao {
     @Query("UPDATE emergency_contacts SET priority = 1")
     suspend fun demoteAll()
 
-    @Query("UPDATE emergency_contacts SET priority = 0 WHERE id = :contactId")
+    @Query("UPDATE emergency_contacts SET priority = 0 WHERE id = :contactId AND enabled = 1")
     suspend fun makePrimary(contactId: Long)
 
     @Query("SELECT COUNT(*) FROM emergency_contacts WHERE enabled = 1 AND priority = 0")
@@ -73,14 +76,23 @@ interface EmergencyDao {
         return event.copy(id = insertEvent(event))
     }
 
-    @Query("UPDATE emergency_events SET status = :status, locationStatus = :locationStatus WHERE id = :eventId")
+    @Query("UPDATE emergency_events SET status = :status, locationStatus = :locationStatus WHERE id = :eventId AND status = 'ACTIVATING'")
     suspend fun activate(eventId: Long, status: String, locationStatus: String)
 
-    @Query("UPDATE emergency_events SET locationStatus = :locationStatus WHERE id = :eventId")
+    @Query("UPDATE emergency_events SET locationStatus = :locationStatus WHERE id = :eventId AND status IN ('ACTIVATING', 'ACTIVE')")
     suspend fun updateLocationStatus(eventId: Long, locationStatus: String)
 
-    @Query("UPDATE emergency_events SET status = :status, endedAt = :endedAt WHERE id = :eventId")
-    suspend fun complete(eventId: Long, status: String, endedAt: Long)
+    @Query("UPDATE emergency_events SET status = :status, endedAt = :endedAt WHERE id = :eventId AND status IN ('ACTIVATING', 'ACTIVE')")
+    suspend fun finishEvent(eventId: Long, status: String, endedAt: Long)
+
+    @Query("UPDATE alert_attempts SET status = 'CANCELLED' WHERE emergencyEventId = :eventId AND status = 'PREPARED'")
+    suspend fun cancelPreparedAlerts(eventId: Long)
+
+    @Transaction
+    suspend fun complete(eventId: Long, status: String, endedAt: Long) {
+        finishEvent(eventId, status, endedAt)
+        cancelPreparedAlerts(eventId)
+    }
 
     @Query("SELECT COUNT(*) FROM alert_attempts WHERE emergencyEventId = :eventId")
     suspend fun alertCount(eventId: Long): Int
@@ -93,11 +105,18 @@ interface EmergencyDao {
 
     /** Freezes the first recipient snapshot for an incident and ignores repeated activation calls. */
     @Transaction
-    suspend fun insertAlertsIfAbsent(eventId: Long, attempts: List<AlertAttemptEntity>) {
-        if (alertCount(eventId) == 0) insertAlerts(attempts)
+    suspend fun insertAlertsIfAbsent(eventId: Long, attempts: List<AlertAttemptEntity>): Boolean {
+        if (attempts.isEmpty() || active()?.let { it.id == eventId && it.status == "ACTIVATING" } != true || alertCount(eventId) != 0) return false
+        insertAlerts(attempts)
+        activate(eventId, "ACTIVE", "NOT_REQUESTED")
+        return true
     }
 
-    @Query("UPDATE alert_attempts SET status = :status, attemptCount = attemptCount + 1, lastAttemptAt = :attemptedAt, errorCode = :errorCode WHERE emergencyEventId = :eventId AND recipientId IN (:recipientIds)")
+    // Persist before external actions. Unknown outcomes after process death must not be retried.
+    @Query("UPDATE alert_attempts SET status = 'UNKNOWN', attemptCount = 1, lastAttemptAt = :attemptedAt WHERE emergencyEventId = :eventId AND status = 'PREPARED' AND EXISTS(SELECT 1 FROM emergency_events WHERE id = :eventId AND status = 'ACTIVE')")
+    suspend fun claimDispatch(eventId: Long, attemptedAt: Long): Int
+
+    @Query("UPDATE alert_attempts SET status = :status, lastAttemptAt = :attemptedAt, errorCode = :errorCode WHERE emergencyEventId = :eventId AND recipientId IN (:recipientIds) AND status = 'UNKNOWN'")
     suspend fun updateAlertOutcomes(
         eventId: Long,
         recipientIds: List<Long>,
@@ -108,10 +127,15 @@ interface EmergencyDao {
 
     @Insert suspend fun insertLocation(point: LocationPointEntity)
 
+    @Transaction
+    suspend fun insertLocationIfActive(point: LocationPointEntity) {
+        if (active()?.id == point.emergencyEventId) insertLocation(point)
+    }
+
     @Query("SELECT COUNT(*) FROM location_points WHERE emergencyEventId = :eventId")
     suspend fun locationCount(eventId: Long): Int
 
-    @Query("DELETE FROM emergency_events WHERE id = :eventId")
+    @Query("DELETE FROM emergency_events WHERE id = :eventId AND status NOT IN ('ACTIVATING', 'ACTIVE')")
     suspend fun deleteEvent(eventId: Long)
 
     @Query("DELETE FROM emergency_events") suspend fun clear()

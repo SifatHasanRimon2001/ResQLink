@@ -27,6 +27,11 @@ class EmergencyNotifier @Inject constructor(
     private val manager = NotificationManagerCompat.from(context)
 
     fun show(eventId: Long) {
+        // Notification settings or OEM services must never block emergency communication.
+        runCatching { showNotification(eventId) }
+    }
+
+    private fun showNotification(eventId: Long) {
         createChannel()
         vibrateActivation()
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -57,7 +62,7 @@ class EmergencyNotifier @Inject constructor(
         manager.notify(NOTIFICATION_ID, notification)
     }
 
-    fun cancel() = manager.cancel(NOTIFICATION_ID)
+    fun cancel() { runCatching { manager.cancel(NOTIFICATION_ID) } }
 
     private fun createChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {

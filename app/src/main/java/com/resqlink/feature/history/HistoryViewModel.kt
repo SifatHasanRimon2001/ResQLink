@@ -1,5 +1,8 @@
 package com.resqlink.feature.history
 
+import com.resqlink.core.util.attemptOperation
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.resqlink.domain.model.EmergencyEvent
@@ -18,5 +21,12 @@ class HistoryViewModel @Inject constructor(
     val events: StateFlow<List<EmergencyEvent>> = repository.observeHistory()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
 
-    fun delete(eventId: Long) = viewModelScope.launch { repository.delete(eventId) }
+    private val message = MutableStateFlow<String?>(null)
+    val userMessage = message.asStateFlow()
+
+    fun delete(eventId: Long) = viewModelScope.launch {
+        attemptOperation { repository.delete(eventId) }
+            .onSuccess { message.value = null }
+            .onFailure { message.value = "History could not be deleted. Please try again." }
+    }
 }

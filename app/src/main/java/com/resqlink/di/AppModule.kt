@@ -1,7 +1,10 @@
 package com.resqlink.di
 
 import android.content.Context
-import androidx.room.Room
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.preferencesDataStore
+import com.resqlink.data.security.EncryptedDatabaseFactory
 import com.resqlink.data.local.ContactDao
 import com.resqlink.data.local.EmergencyDao
 import com.resqlink.data.local.ProfileDao
@@ -28,13 +31,18 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
 import javax.inject.Singleton
 
+private val Context.settingsDataStore: DataStore<Preferences> by preferencesDataStore(name = "resqlink_settings")
+
 @Module
 @InstallIn(SingletonComponent::class)
 object DatabaseModule {
     @Provides
     @Singleton
-    fun database(@ApplicationContext context: Context): ResQLinkDatabase =
-        Room.databaseBuilder(context, ResQLinkDatabase::class.java, "resqlink.db").build()
+    fun database(factory: EncryptedDatabaseFactory): ResQLinkDatabase = factory.build()
+
+    @Provides
+    @Singleton
+    fun preferences(@ApplicationContext context: Context): DataStore<Preferences> = context.settingsDataStore
 
     @Provides fun contacts(database: ResQLinkDatabase): ContactDao = database.contactDao()
     @Provides fun profile(database: ResQLinkDatabase): ProfileDao = database.profileDao()

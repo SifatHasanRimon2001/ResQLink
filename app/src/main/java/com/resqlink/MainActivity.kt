@@ -7,6 +7,8 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.view.MotionEvent
+import android.view.WindowManager
 import android.telephony.SmsManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -26,6 +28,7 @@ import com.resqlink.feature.home.HomeViewModel
 import com.resqlink.feature.onboarding.OnboardingViewModel
 import com.resqlink.feature.profile.ProfileViewModel
 import com.resqlink.feature.settings.SettingsViewModel
+import com.resqlink.domain.model.buildEmergencyMessage
 import dagger.hilt.android.AndroidEntryPoint
 import kotlinx.coroutines.flow.distinctUntilChangedBy
 import kotlinx.coroutines.flow.filterNotNull
@@ -41,7 +44,6 @@ class MainActivity : ComponentActivity() {
     private val profileViewModel by viewModels<ProfileViewModel>()
     private val historyViewModel by viewModels<HistoryViewModel>()
     private val settingsViewModel by viewModels<SettingsViewModel>()
-    private val dispatchedEventIds = mutableSetOf<Long>()
     private var emergencyActivationPending = false
 
     private val locationPermission = registerForActivityResult(
@@ -62,6 +64,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        emergencyActivationPending = savedInstanceState?.getBoolean("activationPending") ?: false
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) window.setHideOverlayWindows(true)
+        window.decorView.filterTouchesWhenObscured = true
         enableEdgeToEdge()
         setContent {
             AppRoot(
@@ -84,6 +90,18 @@ class MainActivity : ComponentActivity() {
         observeEmergencyActions()
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("activationPending", emergencyActivationPending)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        val obscured = event.flags and MotionEvent.FLAG_WINDOW_IS_OBSCURED != 0
+        val partiallyObscured = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q &&
+            event.flags and MotionEvent.FLAG_WINDOW_IS_PARTIALLY_OBSCURED != 0
+        return if (obscured || partiallyObscured) false else super.dispatchTouchEvent(event)
+    }
+
     override fun onResume() {
         super.onResume()
         homeViewModel.refreshPermissions()
@@ -91,7 +109,7 @@ class MainActivity : ComponentActivity() {
 
     private fun observeEmergencyActions() {
         lifecycleScope.launch {
-            repeatOnLifecycle(Lifecycle.State.STARTED) {
+            repeatOnLifecycle(Lifecycle.State.RESUMED) {
                 launch {
                     homeViewModel.activationRequests.collect { requestEmergencyPermissions() }
                 }
@@ -107,6 +125,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestEmergencyPermissions() {
+        if (emergencyActivationPending) return
         val permissions = buildList {
             add(Manifest.permission.SEND_SMS)
             add(Manifest.permission.CALL_PHONE)
@@ -127,9 +146,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    @SuppressLint("MissingPermission")
     private fun dispatchEmergencyActions(draft: AlertDraft) {
-        if (!dispatchedEventIds.add(draft.eventId)) return
+        lifecycleScope.launch {
+            val claimed = homeViewModel.claimDraft(draft.eventId) ?: return@launch
+            performEmergencyActions(claimed)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun performEmergencyActions(draft: AlertDraft) {
         val dispatched = mutableListOf<Long>()
         val failed = mutableListOf<Long>()
         val hasTelephony = packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY)
@@ -137,12 +162,20 @@ class MainActivity : ComponentActivity() {
             ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS) == PackageManager.PERMISSION_GRANTED
 
         if (canSendSms) {
-            val smsManager = getSystemService(SmsManager::class.java)
+            @Suppress("DEPRECATION")
+            val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                getSystemService(SmsManager::class.java)
+            } else {
+                SmsManager.getDefault()
+            }
+            // Built here, at send time, so the freshest coordinates and profile are included.
+            val body = buildEmergencyMessage(draft.content)
             draft.recipients.forEach { recipient ->
                 runCatching {
-                    val parts = smsManager.divideMessage(draft.body)
+                    check(com.resqlink.domain.model.validateContact("Recipient", recipient.phoneNumber).valid)
+                    val parts = requireNotNull(smsManager).divideMessage(body)
                     if (parts.size == 1) {
-                        smsManager.sendTextMessage(recipient.phoneNumber, null, draft.body, null, null)
+                        smsManager.sendTextMessage(recipient.phoneNumber, null, body, null, null)
                     } else {
                         smsManager.sendMultipartTextMessage(recipient.phoneNumber, null, parts, null, null)
                     }
@@ -158,7 +191,7 @@ class MainActivity : ComponentActivity() {
 
         val canCall = hasTelephony &&
             ContextCompat.checkSelfPermission(this, Manifest.permission.CALL_PHONE) == PackageManager.PERMISSION_GRANTED
-        val callStarted = canCall && runCatching {
+        val callStarted = canCall && com.resqlink.domain.model.validateContact("Recipient", draft.primaryPhoneNumber).valid && runCatching {
             startActivity(Intent(Intent.ACTION_CALL, Uri.fromParts("tel", draft.primaryPhoneNumber, null)))
         }.isSuccess
 

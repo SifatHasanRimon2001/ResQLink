@@ -1,6 +1,12 @@
 package com.resqlink.feature.home
 
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.SavedStateHandle
+import com.resqlink.core.util.attemptOperation
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.receiveAsFlow
+import kotlinx.coroutines.flow.first
 import androidx.lifecycle.viewModelScope
 import com.resqlink.domain.model.AppSettings
 import com.resqlink.domain.model.EmergencyContact
@@ -11,8 +17,12 @@ import com.resqlink.domain.model.EmergencyState
 import com.resqlink.domain.model.LocationStatus
 import com.resqlink.domain.model.SystemStatus
 import com.resqlink.domain.model.mostTrusted
+import com.resqlink.domain.model.buildEmergencyMessage
+import com.resqlink.domain.model.EmergencyMessageContent
 import com.resqlink.domain.repository.ContactRepository
 import com.resqlink.domain.repository.EmergencyRepository
+import com.resqlink.domain.repository.LocationRepository
+import com.resqlink.domain.repository.LocationResult
 import com.resqlink.domain.repository.ProfileRepository
 import com.resqlink.domain.repository.SettingsRepository
 import com.resqlink.domain.repository.SystemStatusRepository
@@ -28,6 +38,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 data class AlertRecipient(
@@ -38,7 +49,8 @@ data class AlertRecipient(
 data class AlertDraft(
     val eventId: Long,
     val recipients: List<AlertRecipient>,
-    val body: String,
+    /** Everything needed to compose the message; the body is built when the alert is actually sent. */
+    val content: EmergencyMessageContent,
     val primaryPhoneNumber: String,
 )
 
@@ -70,17 +82,26 @@ class HomeViewModel @Inject constructor(
     contactRepository: ContactRepository,
     profileRepository: ProfileRepository,
     private val emergencyRepository: EmergencyRepository,
-    settingsRepository: SettingsRepository,
+    private val settingsRepository: SettingsRepository,
     private val systemStatusRepository: SystemStatusRepository,
     private val activateEmergency: ActivateEmergency,
     private val captureEmergencyLocation: CaptureEmergencyLocation,
     private val completeEmergency: CompleteEmergency,
+    private val locationRepository: LocationRepository,
+    private val savedStateHandle: SavedStateHandle,
 ) : ViewModel() {
     private val phase = MutableStateFlow<EmergencyState>(EmergencyState.Idle)
     private val draft = MutableStateFlow<AlertDraft?>(null)
     private val message = MutableStateFlow<String?>(null)
-    private val _activationRequests = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
-    val activationRequests = _activationRequests.asSharedFlow()
+    private val activationChannel = Channel<Unit>(Channel.CONFLATED)
+    val activationRequests = activationChannel.receiveAsFlow()
+    private var activationJob: Job? = null
+    private var locationJob: Job? = null
+    private var dispatchingEventId: Long? = null
+    private var stoppedEventId: Long? = null
+    private var permissionRequestPending: Boolean
+        get() = savedStateHandle["permissionRequestPending"] ?: false
+        set(value) { savedStateHandle["permissionRequestPending"] = value }
 
     private val primary = combine(
         emergencyRepository.observeActive(),
@@ -110,7 +131,7 @@ class HomeViewModel @Inject constructor(
 
     fun requestSos() {
         val state = uiState.value
-        if (state.emergencyState is EmergencyState.Active) return
+        if (state.emergencyState is EmergencyState.Active || permissionRequestPending || activationJob?.isActive == true) return
         val contactsReady = state.contacts.any { it.enabled }
         val profileReady = state.profile.isConfigured
         if (!contactsReady || !profileReady) {
@@ -128,45 +149,75 @@ class HomeViewModel @Inject constructor(
 
     /** Requests the Activity-owned dangerous-permission flow after an explicit SOS action. */
     fun activate() {
-        if (uiState.value.emergencyState is EmergencyState.Active || phase.value is EmergencyState.Activating) return
-        phase.value = EmergencyState.Idle
-        _activationRequests.tryEmit(Unit)
+        if (uiState.value.emergencyState is EmergencyState.Active || permissionRequestPending || activationJob?.isActive == true) return
+        permissionRequestPending = true
+        phase.value = EmergencyState.Activating
+        activationChannel.trySend(Unit)
     }
 
     /** Continues after Android has returned the contextual communication and location permissions. */
     fun continueActivation() {
-        if (phase.value is EmergencyState.Activating || uiState.value.emergencyState is EmergencyState.Active) return
-        val snapshot = uiState.value
-        if (snapshot.contacts.none { it.enabled } || !snapshot.profile.isConfigured) {
-            phase.value = EmergencyState.Idle
-            message.value = "Safety setup changed. Complete your profile and contacts, then activate SOS again."
-            return
-        }
+        if (!permissionRequestPending || activationJob?.isActive == true) return
+        permissionRequestPending = false
         phase.value = EmergencyState.Activating
-        viewModelScope.launch {
-            runCatching { activateEmergency(uiState.value.systemStatus.batteryLevel) }
-                .onSuccess { result ->
-                    val current = uiState.value
-                    val trusted = result.recipients.mostTrusted() ?: error("No enabled trusted contact")
+        activationJob = viewModelScope.launch {
+            attemptOperation {
+                val settings = settingsRepository.settings.first()
+                val result = activateEmergency(uiState.value.systemStatus.batteryLevel)
+                val trusted = result.recipients.mostTrusted()
+                if (trusted != null) {
+                    // A cached fix keeps coordinates in the first message; the accurate fix
+                    // arrives later and upgrades the location recorded against the incident.
+                    val cached = attemptOperation { locationRepository.lastKnownLocation() }.getOrNull()
                     draft.value = AlertDraft(
                         eventId = result.eventId,
                         recipients = result.recipients.map { AlertRecipient(it.id, it.phoneNumber) },
-                        body = current.settings.emergencyMessage,
+                        content = EmergencyMessageContent(
+                            configuredMessage = settings.emergencyMessage,
+                            profile = uiState.value.profile,
+                            primaryContact = trusted,
+                            location = (cached as? LocationResult.Available)?.snapshot,
+                        ),
                         primaryPhoneNumber = trusted.phoneNumber,
                     )
-                    viewModelScope.launch {
-                        runCatching { captureEmergencyLocation(result.eventId) }
+                    locationJob = viewModelScope.launch {
+                        attemptOperation { captureEmergencyLocation(result.eventId) }
+                            .onSuccess { snapshot ->
+                                // Upgrade the message if it has not been claimed yet.
+                                if (snapshot != null) {
+                                    draft.update { pending ->
+                                        pending?.takeIf { it.eventId == result.eventId }
+                                            ?.copy(content = pending.content.copy(location = snapshot))
+                                    }
+                                }
+                            }
                             .onFailure {
-                                emergencyRepository.updateLocationStatus(result.eventId, LocationStatus.UNAVAILABLE)
+                                attemptOperation {
+                                    emergencyRepository.updateLocationStatus(result.eventId, LocationStatus.UNAVAILABLE)
+                                }
                             }
                     }
-                    phase.value = EmergencyState.Idle
                 }
-                .onFailure {
-                    phase.value = EmergencyState.Failed(EmergencyFailure.ACTIVATION_FAILED)
-                    message.value = "Emergency activation could not be completed. Your saved data is still available."
-                }
+                phase.value = EmergencyState.Idle
+            }.onFailure {
+                phase.value = EmergencyState.Failed(EmergencyFailure.ACTIVATION_FAILED)
+                message.value = "Emergency activation could not be completed. Check your saved profile and contacts, then try again."
+            }
         }
+    }
+
+    /** Take the draft in memory, then durably claim it before performing external actions. */
+    suspend fun claimDraft(eventId: Long): AlertDraft? {
+        val pending = draft.value?.takeIf { it.eventId == eventId } ?: return null
+        draft.value = null
+        val claimed = attemptOperation { emergencyRepository.claimDispatch(eventId) }
+            .getOrElse {
+                message.value = "Emergency communication could not be prepared. Stop SOS and try again."
+                false
+            }
+        if (!claimed || stoppedEventId == eventId) return null
+        dispatchingEventId = eventId
+        return pending
     }
 
     fun communicationFinished(
@@ -175,24 +226,30 @@ class HomeViewModel @Inject constructor(
         failedRecipientIds: List<Long>,
         callStarted: Boolean,
     ) {
-        if (draft.value?.eventId != eventId) return
-        draft.value = null
+        if (dispatchingEventId != eventId) return
+        dispatchingEventId = null
         viewModelScope.launch {
-            emergencyRepository.recordAlertOutcomes(eventId, dispatchedRecipientIds, failedRecipientIds)
+            val recorded = attemptOperation {
+                emergencyRepository.recordAlertOutcomes(eventId, dispatchedRecipientIds, failedRecipientIds)
+            }.isSuccess
             val smsSummary = if (failedRecipientIds.isEmpty()) {
                 "SMS submitted for ${dispatchedRecipientIds.size} trusted contact${if (dispatchedRecipientIds.size == 1) "" else "s"}."
             } else {
                 "SMS submitted for ${dispatchedRecipientIds.size}; ${failedRecipientIds.size} could not be submitted."
             }
             val callSummary = if (callStarted) " Primary-contact call started." else " Primary-contact call could not start."
-            message.value = smsSummary + callSummary
+            message.value = smsSummary + callSummary +
+                if (recorded) "" else " The result could not be saved; delivery remains unknown."
         }
     }
 
     fun stopEmergency() {
         val event = (uiState.value.emergencyState as? EmergencyState.Active)?.event ?: return
+        draft.value = null
+        stoppedEventId = event.id
+        locationJob?.cancel()
         viewModelScope.launch {
-            runCatching { completeEmergency(event) }
+            attemptOperation { completeEmergency(event) }
                 .onSuccess {
                     phase.value = EmergencyState.Idle
                     draft.value = null

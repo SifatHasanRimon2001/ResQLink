@@ -105,6 +105,7 @@ fun ContactsScreen(viewModel: ContactsViewModel) {
                 PageHeading(stringResource(R.string.contacts_title), stringResource(R.string.contacts_subtitle))
                 Spacer(Modifier.height(12.dp))
             }
+            state.userMessage?.let { error -> item { Text(error, color = MaterialTheme.colorScheme.error) } }
             if (state.contacts.isEmpty()) item { EmptyContacts { formVisible = true } }
             else items(state.contacts, key = { it.id }) { contact ->
                 ContactCard(
@@ -195,6 +196,7 @@ private fun ContactFormDialog(
         title = { Text(stringResource(if (contact == null) R.string.add_contact else R.string.edit_contact)) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                state.userMessage?.let { Text(it, color = MaterialTheme.colorScheme.error) }
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },

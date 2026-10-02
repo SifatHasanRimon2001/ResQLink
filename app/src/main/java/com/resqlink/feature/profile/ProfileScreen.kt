@@ -38,12 +38,16 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.resqlink.R
+import com.resqlink.core.ui.EmergencyMessagePreview
 import com.resqlink.core.ui.PageHeading
+import com.resqlink.core.ui.SectionLabel
 import com.resqlink.domain.model.EmergencyProfile
 
 @Composable
 fun ProfileScreen(viewModel: ProfileViewModel, onBack: () -> Unit) {
     val profile by viewModel.profile.collectAsStateWithLifecycle()
+    val userMessage by viewModel.userMessage.collectAsStateWithLifecycle()
+    val saving by viewModel.saving.collectAsStateWithLifecycle()
     var name by remember { mutableStateOf("") }
     var notes by remember { mutableStateOf("") }
     var address by remember { mutableStateOf("") }
@@ -97,10 +101,17 @@ fun ProfileScreen(viewModel: ProfileViewModel, onBack: () -> Unit) {
                 onClick = {
                     viewModel.save(EmergencyProfile(name, notes, address, information, language))
                 },
-                enabled = name.isNotBlank() && notes.isNotBlank(),
+                enabled = name.isNotBlank() && notes.isNotBlank() && !saving,
                 modifier = Modifier.fillMaxWidth().height(56.dp),
                 shape = RoundedCornerShape(18.dp),
             ) { Text(stringResource(R.string.save), fontWeight = FontWeight.Bold) }
+            userMessage?.let { Text(it, modifier = Modifier.padding(top = 10.dp)) }
+            Spacer(Modifier.height(22.dp))
+            SectionLabel(stringResource(R.string.message_preview_title))
+            Spacer(Modifier.height(10.dp))
+            EmergencyMessagePreview(
+                viewModel.messagePreview(EmergencyProfile(name, notes, address, information, language)),
+            )
             if (name.isBlank() || notes.isBlank()) {
                 Text(
                     stringResource(R.string.profile_required_hint),

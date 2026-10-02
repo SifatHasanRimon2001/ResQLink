@@ -18,7 +18,7 @@ interface ContactRepository {
     suspend fun delete(contact: EmergencyContact)
 }
 
-enum class SaveContactResult { SAVED, DUPLICATE }
+enum class SaveContactResult { SAVED, DUPLICATE, INVALID }
 
 interface ProfileRepository {
     fun observeProfile(): Flow<EmergencyProfile>
@@ -32,7 +32,8 @@ interface EmergencyRepository {
     suspend fun markActive(eventId: Long, locationStatus: LocationStatus)
     suspend fun updateLocationStatus(eventId: Long, locationStatus: LocationStatus)
     suspend fun recordLocation(eventId: Long, location: LocationSnapshot)
-    suspend fun prepareAlerts(eventId: Long, recipients: List<EmergencyContact>)
+    suspend fun prepareAlerts(eventId: Long, recipients: List<EmergencyContact>): Boolean
+    suspend fun claimDispatch(eventId: Long): Boolean
     suspend fun recordAlertOutcomes(eventId: Long, dispatchedRecipientIds: List<Long>, failedRecipientIds: List<Long>)
     suspend fun complete(eventId: Long, cancelled: Boolean = false)
     suspend fun delete(eventId: Long)
@@ -55,6 +56,9 @@ sealed interface LocationResult {
 
 interface LocationRepository {
     suspend fun currentLocation(): LocationResult
+
+    /** Instant cached fix from any enabled provider; never blocks on a fresh GPS acquisition. */
+    suspend fun lastKnownLocation(): LocationResult
 }
 
 interface SystemStatusRepository {

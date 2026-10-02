@@ -13,6 +13,11 @@ import android.net.NetworkRequest
 import android.os.BatteryManager
 import android.os.Build
 import androidx.core.content.ContextCompat
+import androidx.room.withTransaction
+import com.resqlink.data.security.StorageHealth
+import com.resqlink.data.local.ResQLinkDatabase
+import com.resqlink.domain.model.validateContact
+import com.resqlink.notification.EmergencyNotifier
 import com.resqlink.data.local.AlertAttemptEntity
 import com.resqlink.data.local.ContactDao
 import com.resqlink.data.local.EmergencyDao
@@ -51,36 +56,44 @@ import kotlinx.coroutines.launch
 
 @Singleton
 class ContactRepositoryImpl @Inject constructor(
-    private val dao: ContactDao,
+    private val database: ResQLinkDatabase,
+    private val storageHealth: StorageHealth = StorageHealth(),
 ) : ContactRepository {
-    override fun observeContacts() = dao.observeAll().map { rows -> rows.map { it.toDomain() } }
+    private val dao get() = database.contactDao()
+    override fun observeContacts() = storageHealth.observe("contacts", dao.observeAll().map { rows -> rows.map { it.toDomain() } })
 
     override suspend fun enabledContacts() = dao.enabledContacts().map { it.toDomain() }
 
-    override suspend fun save(contact: EmergencyContact): SaveContactResult {
-        if (dao.phoneExists(contact.phoneNumber, contact.id)) return SaveContactResult.DUPLICATE
+    override suspend fun save(contact: EmergencyContact): SaveContactResult = database.withTransaction {
+        val validation = validateContact(contact.name, contact.phoneNumber)
+        if (!validation.valid || contact.id < 0 || contact.email.length > 254) return@withTransaction SaveContactResult.INVALID
+        if (dao.phoneExists(validation.normalizedPhone, contact.id)) return@withTransaction SaveContactResult.DUPLICATE
+        val existing = if (contact.id == 0L) null else dao.find(contact.id)
+            ?: return@withTransaction SaveContactResult.INVALID
         val now = System.currentTimeMillis()
-        val stored = contact.copy(priority = 1)
+        val stored = contact.copy(priority = 1, phoneNumber = validation.normalizedPhone)
         val savedId = if (contact.id == 0L) {
             dao.insert(stored.toEntity(now))
         } else {
-            dao.update(stored.toEntity(now, createdAt = now))
+            dao.update(stored.toEntity(now, createdAt = requireNotNull(existing).createdAt))
             contact.id
         }
         if (contact.enabled && contact.priority == 0) {
-            setPrimary(savedId)
+            dao.demoteAll()
+            dao.makePrimary(savedId)
         } else {
             ensurePrimary()
         }
-        return SaveContactResult.SAVED
+        SaveContactResult.SAVED
     }
 
-    override suspend fun setPrimary(contactId: Long) {
+    override suspend fun setPrimary(contactId: Long) = database.withTransaction {
+        if (dao.find(contactId)?.enabled != true) return@withTransaction
         dao.demoteAll()
         dao.makePrimary(contactId)
     }
 
-    override suspend fun delete(contact: EmergencyContact) {
+    override suspend fun delete(contact: EmergencyContact) = database.withTransaction {
         dao.delete(contact.toEntity(System.currentTimeMillis()))
         ensurePrimary()
     }
@@ -96,22 +109,24 @@ class ContactRepositoryImpl @Inject constructor(
 @Singleton
 class ProfileRepositoryImpl @Inject constructor(
     private val dao: ProfileDao,
+    private val storageHealth: StorageHealth = StorageHealth(),
 ) : ProfileRepository {
-    override fun observeProfile() = dao.observe().map { it?.toDomain() ?: EmergencyProfile() }
+    override fun observeProfile() = storageHealth.observe("profile", dao.observe().map { it?.toDomain() ?: EmergencyProfile() })
     override suspend fun save(profile: EmergencyProfile) = dao.save(profile.toEntity(System.currentTimeMillis()))
 }
 
 @Singleton
 class EmergencyRepositoryImpl @Inject constructor(
     private val dao: EmergencyDao,
+    private val storageHealth: StorageHealth = StorageHealth(),
 ) : EmergencyRepository {
-    override fun observeHistory(): Flow<List<EmergencyEvent>> = dao.observeHistory().map { rows ->
+    override fun observeHistory(): Flow<List<EmergencyEvent>> = storageHealth.observe("history", dao.observeHistory().map { rows ->
         rows.map { it.toDomain(dao.alertCount(it.id)) }
-    }
+    })
 
-    override fun observeActive(): Flow<EmergencyEvent?> = dao.observeActive().map { row ->
+    override fun observeActive(): Flow<EmergencyEvent?> = storageHealth.observe("active-event", dao.observeActive().map { row ->
         row?.toDomain(dao.alertCount(row.id))
-    }
+    })
 
     override suspend fun createOrGetActive(batteryLevel: Int): EmergencyEvent {
         val now = System.currentTimeMillis()
@@ -134,7 +149,7 @@ class EmergencyRepositoryImpl @Inject constructor(
     }
 
     override suspend fun recordLocation(eventId: Long, location: LocationSnapshot) {
-        dao.insertLocation(
+        dao.insertLocationIfActive(
             LocationPointEntity(
                 emergencyEventId = eventId,
                 latitude = location.latitude,
@@ -146,9 +161,9 @@ class EmergencyRepositoryImpl @Inject constructor(
         )
     }
 
-    override suspend fun prepareAlerts(eventId: Long, recipients: List<EmergencyContact>) {
+    override suspend fun prepareAlerts(eventId: Long, recipients: List<EmergencyContact>): Boolean {
         val now = System.currentTimeMillis()
-        dao.insertAlertsIfAbsent(eventId, recipients.map { contact ->
+        return dao.insertAlertsIfAbsent(eventId, recipients.distinctBy { it.id }.map { contact ->
             AlertAttemptEntity(
                 id = UUID.randomUUID().toString(),
                 emergencyEventId = eventId,
@@ -162,6 +177,9 @@ class EmergencyRepositoryImpl @Inject constructor(
             )
         })
     }
+
+    override suspend fun claimDispatch(eventId: Long): Boolean =
+        dao.claimDispatch(eventId, System.currentTimeMillis()) > 0
 
     override suspend fun recordAlertOutcomes(
         eventId: Long,
@@ -258,15 +276,18 @@ class SystemStatusRepositoryImpl @Inject constructor(
 
 @Singleton
 class DataControlRepositoryImpl @Inject constructor(
-    private val contactDao: ContactDao,
-    private val profileDao: ProfileDao,
-    private val emergencyDao: EmergencyDao,
+    private val database: ResQLinkDatabase,
     private val settingsRepository: SettingsRepository,
+    private val notifier: EmergencyNotifier,
 ) : DataControlRepository {
     override suspend fun clearAll() {
-        emergencyDao.clear()
-        contactDao.clear()
-        profileDao.clear()
+        database.withTransaction {
+            check(database.emergencyDao().active() == null) { "Stop the active emergency before clearing data." }
+            database.emergencyDao().clear()
+            database.contactDao().clear()
+            database.profileDao().clear()
+        }
         settingsRepository.clearPreferences()
+        notifier.cancel()
     }
 }

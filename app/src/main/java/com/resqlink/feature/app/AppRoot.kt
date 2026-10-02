@@ -5,6 +5,9 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.material3.Button
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.navigationBarsPadding
@@ -75,15 +78,17 @@ fun AppRoot(
     onOpenAlert: (AlertDraft) -> Unit,
 ) {
     val appState by appViewModel.uiState.collectAsStateWithLifecycle()
+    val onboardingMessage by onboardingViewModel.userMessage.collectAsStateWithLifecycle()
     ResQLinkTheme(appState.settings.theme) {
         AnimatedContent(
-            targetState = appState.loading to appState.settings.onboardingComplete,
+            targetState = Triple(appState.storageUnavailable, appState.loading, appState.settings.onboardingComplete),
             transitionSpec = { fadeIn() togetherWith fadeOut() },
             label = "app_state",
-        ) { (loading, complete) ->
+        ) { (unavailable, loading, complete) ->
             when {
+                unavailable -> StorageUnavailableScreen(appViewModel::retryStorage)
                 loading -> SplashScreen()
-                !complete -> OnboardingScreen(onComplete = onboardingViewModel::complete)
+                !complete -> OnboardingScreen(userMessage = onboardingMessage, onComplete = onboardingViewModel::complete)
                 else -> MainNavigation(
                     homeViewModel,
                     contactsViewModel,
@@ -95,6 +100,20 @@ fun AppRoot(
                 )
             }
         }
+    }
+}
+
+@Composable
+internal fun StorageUnavailableScreen(onRetry: () -> Unit) {
+    Column(
+        Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(24.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text("Saved data is unavailable", style = MaterialTheme.typography.headlineSmall)
+        Text("Your saved files have been kept. Check that your device is unlocked and has free storage, then retry. If this continues, contact support before clearing app data.")
+        Text("For urgent help, use your phone's dialer to call your local emergency number.")
+        Button(onClick = onRetry) { Text("Retry") }
     }
 }
 

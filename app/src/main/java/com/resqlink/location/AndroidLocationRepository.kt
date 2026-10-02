@@ -5,12 +5,10 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.location.Location
-import android.location.LocationListener
 import android.location.LocationManager
-import android.os.Build
-import android.os.Bundle
-import android.os.CancellationSignal
 import androidx.core.content.ContextCompat
+import androidx.core.location.LocationManagerCompat
+import android.os.CancellationSignal
 import com.resqlink.domain.model.LocationSnapshot
 import com.resqlink.domain.repository.LocationRepository
 import com.resqlink.domain.repository.LocationResult
@@ -21,65 +19,73 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
 
+@SuppressLint("MissingPermission") // Every entry point checks the location permission first.
 @Singleton
 class AndroidLocationRepository @Inject constructor(
     @ApplicationContext private val context: Context,
 ) : LocationRepository {
-    private val manager get() = context.getSystemService(LocationManager::class.java)
-
     override suspend fun currentLocation(): LocationResult {
-        if (!hasPermission()) return LocationResult.PermissionDenied
-        val location = withTimeoutOrNull(10_000) { acquireLocation() }
-        return location?.let {
-            LocationResult.Available(
-                LocationSnapshot(
-                    latitude = it.latitude,
-                    longitude = it.longitude,
-                    accuracyMeters = it.accuracy,
-                    capturedAt = it.time.takeIf { timestamp -> timestamp > 0 } ?: System.currentTimeMillis(),
-                    provider = it.provider ?: "unknown",
-                ),
-            )
-        } ?: LocationResult.Unavailable
+        val fine = hasPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+        if (!fine && !hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)) return LocationResult.PermissionDenied
+        return try {
+            val manager = context.getSystemService(LocationManager::class.java) ?: return LocationResult.Unavailable
+            // GPS requires fine permission on older devices; coarse-only users need a network provider.
+            val providers = if (fine) listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)
+                else listOf(LocationManager.NETWORK_PROVIDER)
+            val provider = providers.firstOrNull { it in manager.allProviders && manager.isProviderEnabled(it) }
+                ?: return LocationResult.Unavailable
+            val location = withTimeoutOrNull(10_000) { acquireLocation(manager, provider) }
+            location?.let { LocationResult.Available(it.toSnapshot()) } ?: LocationResult.Unavailable
+        } catch (_: SecurityException) {
+            // Permissions may be revoked between checking and calling the platform.
+            LocationResult.PermissionDenied
+        } catch (_: IllegalArgumentException) {
+            LocationResult.Unavailable
+        } catch (_: IllegalStateException) {
+            LocationResult.Unavailable
+        }
     }
 
-    private fun hasPermission() =
-        ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
-            ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    /**
+     * Returns the freshest cached fix across providers without waiting for a new
+     * acquisition, so the outgoing message can carry coordinates immediately.
+     */
+    override suspend fun lastKnownLocation(): LocationResult {
+        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) &&
+            !hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+        ) return LocationResult.PermissionDenied
+        return try {
+            val manager = context.getSystemService(LocationManager::class.java) ?: return LocationResult.Unavailable
+            val newest = manager.allProviders
+                .filter { manager.isProviderEnabled(it) }
+                .mapNotNull { provider -> manager.getLastKnownLocation(provider) }
+                .maxByOrNull { it.time }
+            newest?.let { LocationResult.Available(it.toSnapshot()) } ?: LocationResult.Unavailable
+        } catch (_: SecurityException) {
+            LocationResult.PermissionDenied
+        } catch (_: IllegalArgumentException) {
+            LocationResult.Unavailable
+        }
+    }
+
+    private fun Location.toSnapshot() = LocationSnapshot(
+        latitude = latitude,
+        longitude = longitude,
+        accuracyMeters = accuracy,
+        capturedAt = time.takeIf { timestamp -> timestamp > 0 } ?: System.currentTimeMillis(),
+        provider = provider ?: "unknown",
+    )
+
+    private fun hasPermission(permission: String) =
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
 
     @SuppressLint("MissingPermission")
-    private suspend fun acquireLocation(): Location? = suspendCancellableCoroutine { continuation ->
-        val provider = when {
-            manager.isProviderEnabled(LocationManager.GPS_PROVIDER) -> LocationManager.GPS_PROVIDER
-            manager.isProviderEnabled(LocationManager.NETWORK_PROVIDER) -> LocationManager.NETWORK_PROVIDER
-            else -> {
-                continuation.resume(null)
-                return@suspendCancellableCoroutine
-            }
-        }
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+    private suspend fun acquireLocation(manager: LocationManager, provider: String): Location? =
+        suspendCancellableCoroutine { continuation ->
             val signal = CancellationSignal()
             continuation.invokeOnCancellation { signal.cancel() }
-            manager.getCurrentLocation(provider, signal, ContextCompat.getMainExecutor(context)) { location ->
+            LocationManagerCompat.getCurrentLocation(manager, provider, signal, ContextCompat.getMainExecutor(context)) { location ->
                 if (continuation.isActive) continuation.resume(location)
             }
-        } else {
-            @Suppress("DEPRECATION")
-            val listener = object : LocationListener {
-                override fun onLocationChanged(location: Location) {
-                    manager.removeUpdates(this)
-                    if (continuation.isActive) continuation.resume(location)
-                }
-                override fun onProviderDisabled(provider: String) {
-                    manager.removeUpdates(this)
-                    if (continuation.isActive) continuation.resume(null)
-                }
-                @Deprecated("Deprecated by Android") override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) = Unit
-            }
-            continuation.invokeOnCancellation { manager.removeUpdates(listener) }
-            @Suppress("DEPRECATION")
-            manager.requestSingleUpdate(provider, listener, null)
         }
-    }
 }
